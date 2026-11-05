@@ -3377,7 +3377,20 @@ pub fn ty_of_column_slot(col: &Column) -> Ty {
     if col.array_stored {
         base = Ty::Array { elem: base.into() };
     }
-    if (col.nullable || col.generated.is_some()) && !col.primary_key {
+    // A string with no schema default starts as nil, including `null:
+    // false`. The database constraint is not the attribute's initial
+    // value: `Model.new.s` is nil, and `self.s ||=` assigns. A declared
+    // default is that value instead, and the slot stays non-nil. An
+    // integer primary key stays non-nil (the insert assigns it); a
+    // string or uuid primary key with no default is nil until then.
+    let string_without_default = matches!(
+        col.col_type,
+        ColumnType::String { .. } | ColumnType::Text | ColumnType::Uuid
+    ) && col.stored_default().is_none()
+        && !col.array_stored;
+    let nilable = string_without_default
+        || ((col.nullable || col.generated.is_some()) && !col.primary_key);
+    if nilable {
         Ty::Union { variants: vec![base, Ty::Nil].into() }
     } else {
         base

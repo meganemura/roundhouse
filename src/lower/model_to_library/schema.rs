@@ -2857,6 +2857,7 @@ fn synth_initialize(
         let has_default = schema_default.is_some();
         let nullable = matches!(super::ty_of_column_slot(col), Ty::Union { .. })
             && (schema_default.is_none() || matches!(scoped, Some(crate::expr::Literal::Nil)));
+        let string_absent = schema_default.clone();
         let default = schema_default.unwrap_or_else(|| default_literal_for_ty(&col_ty));
         // Defaults are stored database values, not assignments through
         // the enum type. In particular, a base constructor must not
@@ -2961,6 +2962,48 @@ fn synth_initialize(
                 },
             );
             stmts.push(guard_unless_nil(lookup, raw_assign));
+        } else if runtime_relation == super::RuntimeRelation::Present
+            && matches!(
+                col.col_type,
+                crate::schema::ColumnType::String { .. }
+                    | crate::schema::ColumnType::Text
+                    | crate::schema::ColumnType::Uuid
+            )
+            && !col.array_stored
+            && !model.enums.contains_key(&col.name)
+        {
+            // `attrs[:col]` is "" for a missing key under spinel, and
+            // `|| ""` is "" on every target. Either one makes
+            // `self.col ||=` a no-op. Absence is `key?`. A missing key
+            // takes the schema default, or nil when there is none,
+            // including a NOT NULL column. An explicit nil stays nil.
+            let string_or_nil = Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() };
+            let present = with_ty(
+                Expr::new(
+                    Span::synthetic(),
+                    ExprNode::Cast { value: lookup.clone(), target_ty: string_or_nil.clone() },
+                ),
+                string_or_nil,
+            );
+            let absent = string_absent.unwrap_or_else(nil_lit);
+            let value = Expr::new(
+                Span::synthetic(),
+                ExprNode::If {
+                    cond: bool_send(var_ref(attrs.clone()), "key?", lit_sym(col.name.clone())),
+                    then_branch: present,
+                    else_branch: absent,
+                },
+            );
+            stmts.push(Expr::new(
+                Span::synthetic(),
+                ExprNode::Send {
+                    recv: Some(self_ref()),
+                    method: col_storage_setter(col),
+                    args: vec![value],
+                    block: None,
+                    parenthesized: false,
+                },
+            ));
         } else {
             // A has_json column: `new(settings: { … })` is Rails'
             // `settings=`, the per-key cast-and-merge — through the
