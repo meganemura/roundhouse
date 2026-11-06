@@ -1027,12 +1027,21 @@ pub(super) fn push_unknown_marker_methods(methods: &mut Vec<MethodDef>, model: &
     }
 }
 
-/// `self.<col> ||= value` (string column) → `if !self.persisted? &&
-/// self.<col>.blank? || self.<col>.nil? then self.<col> = value end`
-/// — see the call-site note in `push_block_callback`. Recursive over
-/// the whole body; only fires for `LValue::Attr` targets on `self`
-/// naming a schema string column.
-fn rewrite_column_or_assign(e: &mut Expr, model: &Model) {
+/// `self.<col> ||= value` (string column) → `self.<col> =
+/// (!self.persisted? && unset(self.<col>) || self.<col>.nil? ? value :
+/// self.<col>)` — see the call-site note in `push_block_callback`.
+/// `unset` reads an unset column's `""`. Recursive over the whole body;
+/// only fires for `LValue::Attr` targets on `self` naming a schema
+/// string column.
+///
+/// One expression that yields the column, as Ruby's `||=` does, so it
+/// stands wherever the `||=` stood: a statement, a method's value, a
+/// local's initializer, a condition. It is also the shape the strict
+/// emitters give `||=` itself (`col = col ?? value`). Unlike Rails'
+/// `||=`, the writer also runs when the column is kept: it writes back
+/// the value the column holds, and the pending-change diff compares
+/// values, so nothing reads as changed.
+fn rewrite_column_or_assign(e: &mut Expr, model: &Model, unset: fn(Span, Expr) -> Expr) {
     use crate::expr::{LValue, OpAssignOp};
     let hit = match &*e.node {
         ExprNode::OpAssign {
@@ -1067,12 +1076,7 @@ fn rewrite_column_or_assign(e: &mut Expr, model: &Model) {
                 ExprNode::BoolOp { op, surface: crate::expr::BoolOpSurface::Symbol, left, right },
             )
         };
-        // Grounded rather than spelled `blank?`: `lower::blank` runs
-        // before this pass, so a synthesized send is never lowered and
-        // never reported. The match above already established the
-        // column is `Ty::Str`, which is the grounding's precondition.
-        // See `blank::synthesized_string_blank`.
-        let blank = crate::lower::blank::synthesized_string_blank(span, self_send(name.as_str()));
+        let blank = unset(span, self_send(name.as_str()));
         // "" reads as unset only on a record that was never saved or
         // loaded. A persisted row's "" is a stored value, and Rails'
         // `||=` keeps it, while a nil the app assigned still fills.
@@ -1085,25 +1089,35 @@ fn rewrite_column_or_assign(e: &mut Expr, model: &Model) {
             bool_op(crate::expr::BoolOpKind::And, send0(self_send("persisted?"), "!"), blank),
             send0(self_send(name.as_str()), "nil?"),
         );
-        let assign = Expr::new(
-            span,
-            ExprNode::Send {
-                recv: Some(Expr::new(span, ExprNode::SelfRef)),
-                method: Symbol::from(format!("{}=", name.as_str())),
-                args: vec![value],
-                block: None,
-                parenthesized: false,
-            },
-        );
-        *e.node = ExprNode::If {
-            cond,
-            then_branch: assign,
-            else_branch: Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
+        let mut column = self_send(name.as_str());
+        column.ty = e.ty.clone();
+        let pick = Expr::new(span, ExprNode::If { cond, then_branch: value, else_branch: column });
+        *e.node = ExprNode::Send {
+            recv: Some(Expr::new(span, ExprNode::SelfRef)),
+            method: Symbol::from(format!("{}=", name.as_str())),
+            args: vec![pick],
+            block: None,
+            parenthesized: false,
         };
-        e.ty = None;
         return;
     }
-    e.node.for_each_child_mut(&mut |c| rewrite_column_or_assign(c, model));
+    e.node.for_each_child_mut(&mut |c| rewrite_column_or_assign(c, model, unset));
+}
+
+/// `<recv> == ""`, a symbol callback's `unset` test in
+/// `rewrite_column_or_assign`.
+fn is_empty_string(span: Span, recv: Expr) -> Expr {
+    let empty = Expr::new(span, ExprNode::Lit { value: Literal::Str { value: String::new() } });
+    Expr::new(
+        span,
+        ExprNode::Send {
+            recv: Some(recv),
+            method: Symbol::from("=="),
+            args: vec![empty],
+            block: None,
+            parenthesized: false,
+        },
+    )
 }
 
 /// Look up an existing `Method` named `hook_name` and append `call` to
@@ -1770,6 +1784,21 @@ fn push_symbol_callback(
         ),
         None => call,
     };
+    // A named method is the callback body, so its `||=` on a string
+    // column is rewritten as a block body's is (`push_block_callback`).
+    // Runs after `push_user_methods`, so the model's own `def` is here.
+    // `== ""` rather than the block body's `ActiveSupport.blank?`: this
+    // runtime starts an unset string column as exactly `""`, Rails keeps
+    // a whitespace value, and no strict runtime defines `blank?`, so the
+    // method compiles wherever its `||=` did.
+    for target in &cb.targets {
+        if let Some(method) = methods
+            .iter_mut()
+            .find(|m| &m.name == target && m.receiver == MethodReceiver::Instance)
+        {
+            rewrite_column_or_assign(&mut method.body, model, is_empty_string);
+        }
+    }
     let mut body = match cb.targets.as_slice() {
         [only] => guarded(self_call(only)),
         targets => seq(targets.iter().map(|t| guarded(self_call(t))).collect()),
@@ -2231,7 +2260,16 @@ fn push_block_callback(
         // its unique token exactly this way in after_initialize).
         // Blank-on-"" is the faithful reading of "unset" under the
         // ""-default storage model, which holds only for a new record.
-        rewrite_column_or_assign(&mut lambda_body, model);
+        // Grounded rather than spelled `blank?`: `lower::blank` runs
+        // before this pass, so a synthesized send is never lowered and
+        // never reported. The rewrite fires only on a `Ty::Str` column,
+        // which is the grounding's precondition. See
+        // `blank::synthesized_string_blank`.
+        rewrite_column_or_assign(
+            &mut lambda_body,
+            model,
+            crate::lower::blank::synthesized_string_blank,
+        );
         // The rewrite synthesizes wrapper nodes; whatever it left
         // span-less attributes to the hook declaration. Source subtrees
         // spliced through keep their exact spans.
