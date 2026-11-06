@@ -11,7 +11,7 @@
 //! Rails 8.1.4 answered.
 
 /// `(name, superclass, declarations, own actions)`. Every controller
-/// whose parent is `Application` defines `load_label`.
+/// rendering `@label` gets `load_label`; `Counts` counts its runs.
 const CONTROLLERS: &[(&str, &str, &str, &[&str])] = &[
     ("Only", "Application", "before_action :load_label\nskip_before_action :load_label, only: [:index]", &["index", "show"]),
     ("Except", "Application", "before_action :load_label\nskip_before_action :load_label, except: [:show]", &["index", "show", "edit"]),
@@ -21,8 +21,11 @@ const CONTROLLERS: &[(&str, &str, &str, &[&str])] = &[
     ("Mixed", "Application", "before_action :load_label\nskip_before_action :load_label, only: [:index], if: -> { params[:skip] == \"1\" }", &["index", "show"]),
     ("Parent", "Application", "before_action :load_label", &["index", "show"]),
     ("Overriding", "Parent", "skip_before_action :load_label, only: [:index]", &["index", "show"]),
+    ("Inheriting", "Parent", "skip_before_action :load_label, only: [:index]", &[]),
     ("GuardedChild", "Parent", "skip_before_action :load_label, unless: -> { params[:keep] == \"1\" }", &[]),
     ("Redeclared", "Unscoped", "before_action :load_label", &["index"]),
+    ("Counts", "Application", "before_action :bump", &["index"]),
+    ("CountsChild", "Counts", "", &[]),
 ];
 
 /// `(path, body)`: `@label` is set only where the filter ran.
@@ -45,9 +48,13 @@ pub const CASES: &[(&str, &str)] = &[
     ("/parent", "index:loaded"),
     ("/overriding", "index:"),
     ("/overriding/show", "show:loaded"),
+    ("/inheriting", "index:"),
+    ("/inheriting/show", "show:loaded"),
     ("/guarded_child/show", "show:"),
     ("/guarded_child/show?keep=1", "show:loaded"),
     ("/redeclared", "index:loaded"),
+    ("/counts", "index:1"),
+    ("/counts_child", "index:1"),
 ];
 
 fn snake(name: &str) -> String {
@@ -66,12 +73,17 @@ fn source(name: &str, parent: &str, declarations: &str, actions: &[&str]) -> Str
     for line in declarations.lines() {
         src.push_str(&format!("  {line}\n"));
     }
+    let ivar = if name == "Counts" { "n" } else { "label" };
     for action in actions {
-        src.push_str(&format!("\n  def {action}\n    render plain: \"{action}:#{{@label}}\"\n  end\n"));
+        src.push_str(&format!("\n  def {action}\n    render plain: \"{action}:#{{@{ivar}}}\"\n  end\n"));
     }
     if parent == "Application" {
         src.push_str("\n  private\n\n  def skipping?\n    params[:skip] == \"1\"\n  end\n");
-        src.push_str("\n  def load_label\n    @label = \"loaded\"\n  end\n");
+        if name == "Counts" {
+            src.push_str("\n  def bump\n    @n = @n.to_i + 1\n  end\n");
+        } else {
+            src.push_str("\n  def load_label\n    @label = \"loaded\"\n  end\n");
+        }
     }
     src.push_str("end\n");
     src

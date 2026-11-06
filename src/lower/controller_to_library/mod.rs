@@ -1243,7 +1243,19 @@ fn build_methods(
     // `own_filter_inlining_is_ordered`. When it declines, every own
     // filter falls through to the preamble, which emits them in
     // declaration order.
-    let inlining_ordered = own_filter_inlining_is_ordered(&before_filters, &privs);
+    //
+    // A subclass reaches its parent's action bodies too, by inheriting
+    // an action or calling `super`, and runs its own chain (its own
+    // skips, its own overrides of the target) in its preamble before
+    // it gets there. A filter spliced into the parent's body would run
+    // a second time there and ignore the subclass's skip, so a
+    // controller with descendants and actions keeps its filters in the
+    // preamble.
+    let has_descendants = all_controllers
+        .iter()
+        .any(|c| ancestor_chain(c, all_controllers).iter().any(|p| p.name == controller.name));
+    let inlining_ordered = !(has_descendants && !publics.is_empty())
+        && own_filter_inlining_is_ordered(&before_filters, &privs);
     let resolve_own = |name: &Symbol, visit: &mut dyn FnMut(&Expr)| {
         if let Some(a) = privs
             .iter()
@@ -1308,9 +1320,6 @@ fn build_methods(
     // BY NAME (`default_periods` in ModNotesController's dispatcher,
     // defined on ModController) — inline-and-drop would leave those
     // calls dangling.
-    let has_descendants = all_controllers
-        .iter()
-        .any(|c| ancestor_chain(c, all_controllers).iter().any(|p| p.name == controller.name));
     let privs_kept: Vec<Action> = privs
         .iter()
         .filter(|a| {
