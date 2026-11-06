@@ -1027,11 +1027,11 @@ pub(super) fn push_unknown_marker_methods(methods: &mut Vec<MethodDef>, model: &
     }
 }
 
-/// `self.<col> ||= value` (string column) → `if self.<col>.blank?
-/// then self.<col> = value end` — see the call-site note in
-/// `push_block_callback`. Recursive over the whole body; only fires
-/// for `LValue::Attr` targets on `self` naming a schema string
-/// column.
+/// `self.<col> ||= value` (string column) → `if !self.persisted? &&
+/// self.<col>.blank? || self.<col>.nil? then self.<col> = value end`
+/// — see the call-site note in `push_block_callback`. Recursive over
+/// the whole body; only fires for `LValue::Attr` targets on `self`
+/// naming a schema string column.
 fn rewrite_column_or_assign(e: &mut Expr, model: &Model) {
     use crate::expr::{LValue, OpAssignOp};
     let hit = match &*e.node {
@@ -1048,22 +1048,43 @@ fn rewrite_column_or_assign(e: &mut Expr, model: &Model) {
     };
     if let Some((name, value)) = hit {
         let span = e.span;
-        let self_read = Expr::new(
-            span,
-            ExprNode::Send {
-                recv: Some(Expr::new(span, ExprNode::SelfRef)),
-                method: name.clone(),
-                args: vec![],
-                block: None,
-                parenthesized: false,
-            },
-        );
+        let send0 = |recv: Expr, method: &str| {
+            Expr::new(
+                span,
+                ExprNode::Send {
+                    recv: Some(recv),
+                    method: Symbol::from(method),
+                    args: vec![],
+                    block: None,
+                    parenthesized: false,
+                },
+            )
+        };
+        let self_send = |method: &str| send0(Expr::new(span, ExprNode::SelfRef), method);
+        let bool_op = |op, left, right| {
+            Expr::new(
+                span,
+                ExprNode::BoolOp { op, surface: crate::expr::BoolOpSurface::Symbol, left, right },
+            )
+        };
         // Grounded rather than spelled `blank?`: `lower::blank` runs
         // before this pass, so a synthesized send is never lowered and
         // never reported. The match above already established the
         // column is `Ty::Str`, which is the grounding's precondition.
         // See `blank::synthesized_string_blank`.
-        let blank = crate::lower::blank::synthesized_string_blank(span, self_read);
+        let blank = crate::lower::blank::synthesized_string_blank(span, self_send(name.as_str()));
+        // "" reads as unset only on a record that was never saved or
+        // loaded. A persisted row's "" is a stored value, and Rails'
+        // `||=` keeps it, while a nil the app assigned still fills.
+        // `nil?` rather than Ruby's own `!`: a target whose column is a
+        // non-nullable String answers `nil?` with false but cannot
+        // negate a String. `persisted?` rather than `new_record?`: see
+        // `guard_validation_on`.
+        let cond = bool_op(
+            crate::expr::BoolOpKind::Or,
+            bool_op(crate::expr::BoolOpKind::And, send0(self_send("persisted?"), "!"), blank),
+            send0(self_send(name.as_str()), "nil?"),
+        );
         let assign = Expr::new(
             span,
             ExprNode::Send {
@@ -1075,7 +1096,7 @@ fn rewrite_column_or_assign(e: &mut Expr, model: &Model) {
             },
         );
         *e.node = ExprNode::If {
-            cond: blank,
+            cond,
             then_branch: assign,
             else_branch: Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
         };
@@ -2208,8 +2229,8 @@ fn push_block_callback(
         // "" (strict targets assign every field), which is truthy and
         // would starve the idiom (lobsters' Token concern generates
         // its unique token exactly this way in after_initialize).
-        // Blank-on-"" IS the faithful reading of "unset" under the
-        // ""-default storage model.
+        // Blank-on-"" is the faithful reading of "unset" under the
+        // ""-default storage model, which holds only for a new record.
         rewrite_column_or_assign(&mut lambda_body, model);
         // The rewrite synthesizes wrapper nodes; whatever it left
         // span-less attributes to the hook declaration. Source subtrees
