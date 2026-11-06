@@ -118,6 +118,10 @@ mod send_data_filename;
 mod vary_accept_contract;
 #[path = "spinel_toolchain/vary_accept.rs"]
 mod vary_accept;
+#[path = "support/column_or_assign_callback.rs"]
+mod column_or_assign_callback_contract;
+#[path = "spinel_toolchain/column_or_assign_callback.rs"]
+mod column_or_assign_callback;
 #[path = "support/erb_template.rs"]
 mod erb_template_contract;
 #[path = "support/bare_permit.rs"]

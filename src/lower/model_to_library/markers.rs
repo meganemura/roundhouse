@@ -1029,9 +1029,10 @@ pub(super) fn push_unknown_marker_methods(methods: &mut Vec<MethodDef>, model: &
 
 /// `self.<col> ||= value` (string column) → `if self.<col>.blank?
 /// then self.<col> = value end` — see the call-site note in
-/// `push_block_callback`. Recursive over the whole body; only fires
-/// for `LValue::Attr` targets on `self` naming a schema string
-/// column.
+/// `push_block_callback`. Applied to a block callback's body and to
+/// the method a symbol callback names. Recursive over the whole body;
+/// only fires for `LValue::Attr` targets on `self` naming a schema
+/// string column.
 fn rewrite_column_or_assign(e: &mut Expr, model: &Model) {
     use crate::expr::{LValue, OpAssignOp};
     let hit = match &*e.node {
@@ -1077,7 +1078,7 @@ fn rewrite_column_or_assign(e: &mut Expr, model: &Model) {
         *e.node = ExprNode::If {
             cond: blank,
             then_branch: assign,
-            else_branch: Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
+            else_branch: Expr::new(span, ExprNode::Lit { value: Literal::Nil }),
         };
         e.ty = None;
         return;
@@ -1749,6 +1750,17 @@ fn push_symbol_callback(
         ),
         None => call,
     };
+    // A named method is the callback body, so its `||=` on a string
+    // column is guarded as a block body's is (`push_block_callback`).
+    // Runs after `push_user_methods`, so the model's own `def` is here.
+    for target in &cb.targets {
+        if let Some(method) = methods
+            .iter_mut()
+            .find(|m| &m.name == target && m.receiver == MethodReceiver::Instance)
+        {
+            rewrite_column_or_assign(&mut method.body, model);
+        }
+    }
     let mut body = match cb.targets.as_slice() {
         [only] => guarded(self_call(only)),
         targets => seq(targets.iter().map(|t| guarded(self_call(t))).collect()),
