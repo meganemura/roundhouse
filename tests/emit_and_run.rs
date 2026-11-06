@@ -257,6 +257,10 @@ mod send_data_filename;
 mod vary_accept_contract;
 #[path = "emit_and_run/vary_accept.rs"]
 mod vary_accept;
+#[path = "support/skip_before_action.rs"]
+mod skip_before_action_contract;
+#[path = "emit_and_run/skip_before_action.rs"]
+mod skip_before_action;
 #[path = "emit_and_run/strong_params.rs"]
 mod strong_params;
 #[path = "emit_and_run/parameter_defaults.rs"]

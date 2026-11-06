@@ -1230,10 +1230,9 @@ fn build_methods(
         Some(set) => publics_all.into_iter().partition(|a| set.contains(&a.name)),
         None => (publics_all, Vec::new()),
     };
-    let before_filters: Vec<&Filter> = controller
-        .filters()
-        .filter(|f| matches!(f.kind, FilterKind::Before))
-        .collect();
+    // Each own before_action as it runs once the chain's later
+    // `skip_before_action`s have narrowed it; one fully skipped is gone.
+    let before_filters = own_before_filters(controller, all_controllers);
 
     // Inline before_action filter bodies into each action that
     // fires them. This pushes the assignment to `@article` (etc) into
@@ -1244,7 +1243,7 @@ fn build_methods(
     // `own_filter_inlining_is_ordered`. When it declines, every own
     // filter falls through to the preamble, which emits them in
     // declaration order.
-    let inlining_ordered = own_filter_inlining_is_ordered(controller, &privs);
+    let inlining_ordered = own_filter_inlining_is_ordered(&before_filters, &privs);
     let resolve_own = |name: &Symbol, visit: &mut dyn FnMut(&Expr)| {
         if let Some(a) = privs
             .iter()
@@ -1971,10 +1970,12 @@ fn filter_is_spliceable(f: &Filter, privs: &[Action]) -> bool {
 ///
 /// ANCESTORS' filters are not consulted: Rails runs them before the
 /// controller's own, which is exactly where the preamble puts them.
-fn own_filter_inlining_is_ordered(controller: &Controller, privs: &[Action]) -> bool {
+/// `filters` are the controller's own, as `own_before_filters` narrows
+/// them.
+fn own_filter_inlining_is_ordered(filters: &[Filter], privs: &[Action]) -> bool {
     let own_priv = |target: &Symbol| privs.iter().any(|a| &a.name == target);
     let mut seen_inlinable = false;
-    for f in controller.filters().filter(|f| matches!(f.kind, FilterKind::Before)) {
+    for f in filters {
         // A guarded or early-returning own-private filter is never
         // inlined (see `filter_is_spliceable`): it stays in the
         // preamble exactly like an ancestor-target filter, so it doesn't
@@ -2054,7 +2055,7 @@ fn collect_self_send_names(
 /// non-administrator got a 403 AND the room was deleted.
 fn inline_before_filters(
     action: &Action,
-    filters: &[&Filter],
+    filters: &[Filter],
     privs: &[Action],
     resolve: &dyn Fn(&Symbol, &mut dyn FnMut(&Expr)),
 ) -> Action {
@@ -2101,6 +2102,181 @@ fn inline_before_filters(
     new_action
 }
 
+/// Where a declaration sits in the order Rails evaluates a chain's
+/// class bodies: the class's depth from the root ancestor, then its
+/// index in that body. A skip changes only the callbacks already
+/// declared when it runs.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ChainPosition(usize, usize);
+
+impl ChainPosition {
+    /// ActionController::Base, ahead of every app class.
+    const BASE: ChainPosition = ChainPosition(0, 0);
+
+    fn of(depth: usize, index: usize) -> ChainPosition {
+        ChainPosition(depth + 1, index)
+    }
+}
+
+/// Every `skip_*` that `classes` (root-most first) declare, with where.
+/// Kept whole rather than reduced to a set of names: a skip carries
+/// `only:`/`except:`/`if:`/`unless:` of its own, and campfire's
+/// `allow_unauthenticated_access only: %i[new create]` means the filter
+/// still runs everywhere else. Dropping the filter outright would sign
+/// every other action out of its own authentication, `destroy` (sign
+/// OUT) among them.
+fn chain_skips<'a>(classes: &[&'a Controller]) -> Vec<(ChainPosition, &'a Filter)> {
+    let mut out = Vec::new();
+    for (depth, c) in classes.iter().enumerate() {
+        for (index, item) in c.body.iter().enumerate() {
+            if let ControllerBodyItem::Filter { filter, .. } = item {
+                if filter.kind.is_skip() {
+                    out.push((ChainPosition::of(depth, index), filter));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `controller`'s own `before_action`s, each narrowed by the skips
+/// declared after it (`narrow_by_skips`); a fully skipped one is gone.
+fn own_before_filters(controller: &Controller, all: &[Controller]) -> Vec<Filter> {
+    let chain = ancestor_chain(controller, all);
+    let classes: Vec<&Controller> =
+        chain.iter().copied().chain(std::iter::once(controller)).collect();
+    let skips = chain_skips(&classes);
+    controller
+        .body
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| match item {
+            ControllerBodyItem::Filter { filter, .. }
+                if matches!(filter.kind, FilterKind::Before) =>
+            {
+                narrow_by_skips(filter, ChainPosition::of(chain.len(), index), &skips)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// `f`, declared at `at`, as the skips declared after it leave it:
+/// `None` when one removes it outright, otherwise the actions and
+/// conditions it still runs under, which the inliner
+/// (`inline_before_filters`) and the dispatcher (`filter_cond`) both
+/// enforce.
+///
+/// Rails turns a skip's `only:` into an `if:` and its `except:` into an
+/// `unless:`, then adds each of its `if:` conditions to the callback's
+/// `unless:` and each `unless:` to its `if:`. Every option of a skip
+/// therefore narrows on its own: `skip_before_action :x, only: :index,
+/// if: :y?` skips `x` on `index` always and on every action while `y?`
+/// holds (what Rails 8.1 answers).
+fn narrow_by_skips(
+    f: &Filter,
+    at: ChainPosition,
+    skips: &[(ChainPosition, &Filter)],
+) -> Option<Filter> {
+    let mut f = f.clone();
+    for (_, skip) in skips.iter().filter(|(skip_at, s)| {
+        *skip_at > at && s.target == f.target && s.kind.skipped_kind().as_ref() == Some(&f.kind)
+    }) {
+        let guarded = skip.if_cond.is_some()
+            || skip.unless_cond.is_some()
+            || skip.if_cond_expr.is_some()
+            || skip.unless_cond_expr.is_some();
+        if skip.only.is_empty() && skip.except.is_empty() && !guarded {
+            return None;
+        }
+        if !skip.only.is_empty() {
+            if f.only.is_empty() {
+                for a in &skip.only {
+                    if !f.except.contains(a) {
+                        f.except.push(a.clone());
+                    }
+                }
+            } else {
+                // `only:` wins over `except:` wherever a filter is
+                // scoped, so the skipped actions leave `only:` itself.
+                f.only.retain(|a| !skip.only.contains(a));
+                if f.only.is_empty() {
+                    return None;
+                }
+            }
+        }
+        // `skip … except: [:x]` skips everywhere BUT x, so what
+        // survives runs only for x.
+        if !skip.except.is_empty() {
+            f.only = if f.only.is_empty() {
+                skip.except.iter().filter(|a| !f.except.contains(a)).cloned().collect()
+            } else {
+                f.only.iter().filter(|a| skip.except.contains(a)).cloned().collect()
+            };
+            if f.only.is_empty() {
+                return None;
+            }
+        }
+        add_guard(
+            &mut f.unless_cond,
+            &mut f.unless_cond_expr,
+            &skip.if_cond,
+            &skip.if_cond_expr,
+            crate::expr::BoolOpKind::Or,
+        );
+        add_guard(
+            &mut f.if_cond,
+            &mut f.if_cond_expr,
+            &skip.unless_cond,
+            &skip.unless_cond_expr,
+            crate::expr::BoolOpKind::And,
+        );
+    }
+    Some(f)
+}
+
+/// Add one condition to a filter's `if:` (joined with `op` = And) or
+/// `unless:` (`op` = Or) guard: into the Symbol slot while it is free,
+/// otherwise joined onto the expression slot.
+fn add_guard(
+    sym_slot: &mut Option<Symbol>,
+    expr_slot: &mut Option<Expr>,
+    sym: &Option<Symbol>,
+    expr: &Option<Expr>,
+    op: crate::expr::BoolOpKind,
+) {
+    let term = match (sym, expr) {
+        (Some(name), _) if sym_slot.is_none() => {
+            *sym_slot = Some(name.clone());
+            return;
+        }
+        (Some(name), _) => Expr::new(
+            Span::synthetic(),
+            ExprNode::Send {
+                recv: None,
+                method: name.clone(),
+                args: vec![],
+                block: None,
+                parenthesized: false,
+            },
+        ),
+        (None, Some(e)) => e.clone(),
+        (None, None) => return,
+    };
+    *expr_slot = Some(match expr_slot.take() {
+        Some(prev) => Expr::new(
+            Span::synthetic(),
+            ExprNode::BoolOp {
+                op,
+                surface: crate::expr::BoolOpSurface::Symbol,
+                left: prev,
+                right: term,
+            },
+        ),
+        None => term,
+    });
+}
+
 /// Assemble the before_action preamble for `controller`'s dispatcher —
 /// the filters `inline_before_filters` can't reach. Order matches Rails:
 /// ancestors' filters first (root-most ancestor first), then the
@@ -2118,9 +2294,10 @@ fn inline_before_filters(
 /// excluded — those are inlined into the action bodies upstream (the
 /// body-typer seeds ivar types from them), so a controller with only
 /// those (the blog shape) gets an empty preamble and a byte-identical
-/// dispatcher. `skip_before_action` targets anywhere in the chain drop
-/// the matching filter. A filter naming a method that resolves nowhere
-/// in the chain (a framework built-in) is dropped, matching the
+/// dispatcher. A `skip_before_action` declared after a filter narrows
+/// or drops it (`narrow_by_skips`). A filter naming a method that
+/// resolves nowhere in the chain (a framework built-in) is dropped,
+/// matching the
 /// previous silently-skipped behavior — except
 /// `verify_authenticity_token`, the forgery check, which the ruby
 /// family's runtime defines (Rails' `default_protect_from_forgery`,
@@ -2133,20 +2310,10 @@ fn build_filter_preamble(
     own_privs_inlined: bool,
 ) -> (Vec<PreambleStmt>, process_action::WrapFilters) {
     let chain = ancestor_chain(controller, all_controllers);
-
-    // Skips, kept whole rather than reduced to a set of names: a skip
-    // carries `only:`/`except:` of its own, and campfire's
-    // `allow_unauthenticated_access only: %i[new create]` means the
-    // filter still runs everywhere else. Dropping the filter outright
-    // would sign every other action out of its own authentication —
-    // `destroy` (sign OUT) among them.
-    let skips: Vec<&Filter> = chain
-        .iter()
-        .copied()
-        .chain(std::iter::once(controller))
-        .flat_map(|c| c.filters())
-        .filter(|f| f.kind.is_skip())
-        .collect();
+    let classes: Vec<&Controller> =
+        chain.iter().copied().chain(std::iter::once(controller)).collect();
+    let skips = chain_skips(&classes);
+    let narrow = |f: &Filter, at: ChainPosition| narrow_by_skips(f, at, &skips);
 
     // Resolve a filter target's body — self first, then nearest ancestor
     // (Ruby method resolution order) — so the halting check can be
@@ -2164,41 +2331,8 @@ fn build_filter_preamble(
 
     let mut preamble: Vec<PreambleStmt> = Vec::new();
     let mut wraps = process_action::WrapFilters::default();
-    // Apply every skip naming this target. An unscoped skip removes the
-    // filter; a scoped one narrows where it still runs, which the
-    // dispatcher already enforces per action (`filter_cond` emits the
-    // only/except guard).
-    let narrow = |f: &Filter| -> Option<Filter> {
-        let mut f = f.clone();
-        for skip in skips
-            .iter()
-            .filter(|s| s.target == f.target && s.kind.skipped_kind().as_ref() == Some(&f.kind))
-        {
-            if skip.only.is_empty() && skip.except.is_empty() {
-                return None;
-            }
-            for a in &skip.only {
-                if !f.except.contains(a) {
-                    f.except.push(a.clone());
-                }
-            }
-            // `skip … except: [:x]` skips everywhere BUT x, so what
-            // survives runs only for x.
-            if !skip.except.is_empty() {
-                f.only = if f.only.is_empty() {
-                    skip.except.clone()
-                } else {
-                    f.only.iter().filter(|a| skip.except.contains(a)).cloned().collect()
-                };
-                if f.only.is_empty() {
-                    return None;
-                }
-            }
-        }
-        Some(f)
-    };
-    let push_call = |f: &Filter, preamble: &mut Vec<PreambleStmt>| {
-        let Some(f) = narrow(f) else { return };
+    // `f` arrives already narrowed by the skips after it.
+    let push_call = |f: Filter, preamble: &mut Vec<PreambleStmt>| {
         let f = &f;
         let Some(target) = find_target(&f.target) else {
             // The one framework-defined target the chain carries: the
@@ -2257,7 +2391,9 @@ fn build_filter_preamble(
         && root_parent.is_some_and(|p| p.0.as_str() == "ActionController::Base")
         && !redeclared
     {
-        push_call(&default_forgery_protection(), &mut preamble);
+        if let Some(f) = narrow(&default_forgery_protection(), ChainPosition::BASE) {
+            push_call(f, &mut preamble);
+        }
     }
 
     // Ancestors and the controller itself walk the same way, in body
@@ -2277,21 +2413,24 @@ fn build_filter_preamble(
     // sees unshifts onto the same head, so the last one declared is the
     // first one that runs.
     let mut prepends: Vec<PreambleStmt> = Vec::new();
-    let bodies = chain.iter().map(|c| (*c, false)).chain(std::iter::once((controller, true)));
-    for (c, is_own) in bodies {
-        for item in &c.body {
+    for (depth, c) in classes.iter().enumerate() {
+        let is_own = depth == chain.len();
+        for (index, item) in c.body.iter().enumerate() {
+            let at = ChainPosition::of(depth, index);
             match item {
                 ControllerBodyItem::Filter { filter, .. }
                     if matches!(filter.kind, FilterKind::Before) =>
                 {
+                    let Some(f) = narrow(filter, at) else { continue };
                     if is_own
                         && own_privs_inlined
-                        && own_priv_targets.contains(&filter.target)
-                        && filter_is_spliceable(filter, own_privs)
+                        && own_priv_targets.contains(&f.target)
+                        && filter_is_spliceable(&f, own_privs)
                     {
                         continue; // inlined into action bodies upstream
                     }
-                    push_call(filter, if filter.prepend { &mut prepends } else { &mut preamble });
+                    let prepend = f.prepend;
+                    push_call(f, if prepend { &mut prepends } else { &mut preamble });
                 }
                 // `around_action` / `after_action` — carried to the
                 // dispatcher, which wraps the case dispatch in the one
@@ -2301,7 +2440,7 @@ fn build_filter_preamble(
                 ControllerBodyItem::Filter { filter, .. }
                     if matches!(filter.kind, FilterKind::Around | FilterKind::After) =>
                 {
-                    let Some(f) = narrow(filter) else { continue };
+                    let Some(f) = narrow(filter, at) else { continue };
                     if find_target(&f.target).is_none() {
                         continue;
                     }
