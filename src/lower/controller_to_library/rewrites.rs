@@ -1203,15 +1203,21 @@ fn may_be_str(ty: Option<&Ty>) -> bool {
     }
 }
 
-/// Select the bundled JSON encoder for proven primitive collections; retain
-/// Rails serialization for values requiring custom hooks or temporal conversion.
-pub(super) fn json_render_encode(value: &Expr) -> Expr {
+/// Whether `json_render_encode` writes `value` with the bundled JSON encoder,
+/// which every tree carries, rather than the runtime `JsonRender`.
+pub(crate) fn json_render_is_primitive(value: &Expr) -> bool {
     // JSON's bundled encoder already handles primitive collections on every
     // target. Keep values that need Rails' as_json hooks (including nested
     // models and Time) on the existing serializer path.
     let collection = matches!(&*value.node, ExprNode::Hash { .. } | ExprNode::Array { .. })
         || value.ty.as_ref().is_some_and(json_collection_type);
-    let primitive_collection = collection && json_primitive_value(value);
+    collection && json_primitive_value(value)
+}
+
+/// Select the bundled JSON encoder for proven primitive collections; retain
+/// Rails serialization for values requiring custom hooks or temporal conversion.
+pub(super) fn json_render_encode(value: &Expr) -> Expr {
+    let primitive_collection = json_render_is_primitive(value);
     let recv = Expr::new(
         value.span,
         ExprNode::Const {

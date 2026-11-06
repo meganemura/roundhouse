@@ -148,6 +148,8 @@ mod response_headers;
 mod action_dispatch_request_put;
 #[path = "spinel_toolchain/strong_params.rs"]
 mod strong_params;
+#[path = "spinel_toolchain/render_json_errors.rs"]
+mod render_json_errors;
 #[path = "spinel_toolchain/params_wrapper.rs"]
 mod params_wrapper;
 #[path = "spinel_toolchain/json_request_values.rs"]

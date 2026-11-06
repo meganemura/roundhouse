@@ -22,6 +22,7 @@ use crate::span::Span;
 
 use super::actions::resolve_before_actions;
 use super::util::{is_format_binding, unwrap_lambda};
+use crate::lower::controller_to_library::rewrites::json_render_is_primitive;
 
 /// Flatten every `respond_to do |format| ... end` block in `expr`
 /// into just its HTML branch — the legacy behavior used by the
@@ -70,18 +71,29 @@ pub struct FormatBreadth {
     /// targets read no JSON body (Rust, Python) or no body params apart
     /// (TypeScript), so they do not.
     pub wraps_json_params: bool,
+    /// The tree keeps a `format.json` arm whose `render json:` value is a
+    /// primitive collection, such as the scaffold's `render json:
+    /// @article.errors` (by then the attribute-keyed Hash of Strings
+    /// `errors_json` answers). The controller rewrite writes it with the
+    /// bundled `JSON.generate`, as it does the same render outside a
+    /// `respond_to`, so it needs no JsonRender. Not the strict targets:
+    /// Go's emit of that render passes `json_render_escape` itself where
+    /// its value belongs, and does not compile.
+    pub json_primitive: bool,
 }
 
 impl FormatBreadth {
     /// html only (plus the simple-`render :sym` json arms) — the emit
     /// paths that don't recognize `request_format` at all.
-    pub const NARROW: Self = Self { json_any: false, rss: false, raises_param_missing: false, wraps_json_params: false };
-    /// The spinel/AOT tree: rss dispatch, no JsonRender.
+    pub const NARROW: Self =
+        Self { json_any: false, rss: false, raises_param_missing: false, wraps_json_params: false, json_primitive: false };
+    /// The spinel/AOT tree: rss dispatch and the primitive json arms, no
+    /// JsonRender.
     pub const RSS_ONLY: Self =
-        Self { json_any: false, rss: true, raises_param_missing: true, wraps_json_params: true };
+        Self { json_any: false, rss: true, raises_param_missing: true, wraps_json_params: true, json_primitive: true };
     /// The CRuby/JRuby trees, whose overlay answers the full surface.
     pub const FULL: Self =
-        Self { json_any: true, rss: true, raises_param_missing: true, wraps_json_params: true };
+        Self { json_any: true, rss: true, raises_param_missing: true, wraps_json_params: true, json_primitive: true };
 }
 
 /// Format-dispatching variant of `unwrap_respond_to`.
@@ -375,6 +387,9 @@ fn json_arm_drop_reason(
     if bare || breadth.json_any || is_simple_render_sym(branch_body) || is_encoded_render(branch_body) {
         return None;
     }
+    if breadth.json_primitive && render_option(branch_body, "json").is_some_and(json_render_is_primitive) {
+        return None;
+    }
     Some("inline `render json: <expr>` needs an encoder this tree has none for")
 }
 
@@ -424,21 +439,23 @@ fn is_simple_render_sym(body: &Expr) -> bool {
 /// no longer reaches the runtime encoder the narrow breadths exclude and
 /// travels like any other plain render.
 fn is_encoded_render(body: &Expr) -> bool {
+    render_option(body, "plain").is_some() && render_option(body, "json").is_none()
+}
+
+/// The `key:` value of `body` when it is one `render key: …, …` call.
+fn render_option<'a>(body: &'a Expr, key: &str) -> Option<&'a Expr> {
     let body = match &*body.node {
         ExprNode::Seq { exprs } if exprs.len() == 1 => &exprs[0],
         _ => body,
     };
-    let ExprNode::Send { recv: None, method, args, .. } = &*body.node else { return false };
+    let ExprNode::Send { recv: None, method, args, .. } = &*body.node else { return None };
     if method.as_str() != "render" || args.len() != 1 {
-        return false;
+        return None;
     }
-    let ExprNode::Hash { entries, .. } = &*args[0].node else { return false };
-    let has = |name: &str| {
-        entries.iter().any(|(k, _)| {
-            matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == name)
-        })
-    };
-    has("plain") && !has("json")
+    let ExprNode::Hash { entries, .. } = &*args[0].node else { return None };
+    entries.iter().find_map(|(k, v)| {
+        matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == key).then_some(v)
+    })
 }
 
 /// Build the `if request_format == :json; <json>; else; <html>; end`
