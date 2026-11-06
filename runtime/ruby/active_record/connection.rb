@@ -1568,8 +1568,8 @@ module ActiveRecord
     # applies the scope (or not, inside `unscoped { }`): these class
     # forms answer from it rather than from the model's whole-table
     # adapter primitives, which base.rb's defaults use.
-    def self.count
-      return all.count unless _default_scope_where.empty?
+    def self.count(column = nil)
+      return all.count(column) unless column.nil? && _default_scope_where.empty?
       _adapter_count
     end
 

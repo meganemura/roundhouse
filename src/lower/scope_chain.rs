@@ -2679,7 +2679,8 @@ pub fn mentions_assoc_lookup(expr: &Expr, assocs: &AssocRegistry) -> bool {
                             | "left_joins" | "includes" | "preload" | "eager_load" | "references" | "group"
                             | "having" | "merge" | "unscope"
                     ));
-            if is_where || method.as_str().starts_with("find_by_") && block.is_none()
+            let is_column_count = block.is_none() && super::arel::is_column_count(method.as_str(), args);
+            if is_where || is_column_count || method.as_str().starts_with("find_by_") && block.is_none()
                 || is_relation_terminal(method.as_str(), args, block.as_ref())
                     && matches!(
                         method.as_str(),

@@ -276,7 +276,7 @@ impl<'a> BodyTyper<'a> {
         args: &[Expr],
         block: Option<&Expr>,
     ) -> Option<Ty> {
-        if method.as_str() != "count" || !args.is_empty() || block.is_some() {
+        if method.as_str() != "count" || args.len() > 1 || block.is_some() {
             return None;
         }
         let group_args = Self::group_args_in_count_chain(recv?)?;

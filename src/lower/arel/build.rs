@@ -124,7 +124,7 @@ pub fn try_build_arel_with_assocs(
         // `group_count` rides along: it is the same terminal after
         // `lower::group_count` renames it, and which spelling arrives
         // here depends on the caller (see `grouped_count_parts`).
-        "count" | "group_count" if args.is_empty() => {
+        "count" | "group_count" if args.len() <= 1 => {
             // `group(:col).count` — recognized as a PAIR, never as a
             // `group` refiner on its own. A lone `group(:col)` would
             // fold to `SELECT * … GROUP BY col`, one arbitrary row per
@@ -150,6 +150,9 @@ pub fn try_build_arel_with_assocs(
                 return None;
             }
             let (op, owner) = try_chain_recv(recv, schema, registry, assocs)?;
+            if !counts_every_row(args, &owner, schema, registry) {
+                return None;
+            }
             return apply_count(op).map(|op| (op, owner));
         }
         _ => {}
@@ -357,6 +360,34 @@ fn apply_pluck(
         column,
     });
     Some(ArelOp::Select(sel))
+}
+
+/// `count(:all)`, `count("*")` and `count(:<primary key>)` are the bare
+/// `count`'s COUNT(*): Rails sends `:all` as `*`, and a primary key is
+/// never NULL. No chain this builder composes is `distinct`, which would
+/// make `count(:id)` count distinct ids. Any other argument counts a
+/// column's non-NULL values, which only the runtime Relation composes.
+fn counts_every_row(
+    args: &[Expr],
+    owner: &ClassId,
+    schema: &Schema,
+    registry: &HashMap<ClassId, ClassInfo>,
+) -> bool {
+    let [arg] = args else { return args.is_empty() };
+    match arg.node.as_ref() {
+        ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "all" => return true,
+        ExprNode::Lit { value: Literal::Str { value } } if value.as_str() == "*" => return true,
+        _ => {}
+    }
+    let Some(column) = column_name_arg(arg) else { return false };
+    let Some(info) = registry.get(owner) else { return false };
+    let schema_key = info
+        .table
+        .as_ref()
+        .and_then(|t| schema.tables.get(&t.0))
+        .and_then(|t| t.columns.iter().find(|c| c.primary_key))
+        .map(|c| &c.name);
+    info.primary_key.as_ref().or(schema_key) == Some(&column)
 }
 
 /// `.count` on an existing chain — swap the projection for `COUNT(*)`.

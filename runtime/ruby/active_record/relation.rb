@@ -2114,9 +2114,14 @@ module ActiveRecord
       limit
     end
 
-    def count
+    # `count(:col)` is `COUNT(col)`, which skips NULLs, and a String is
+    # a SQL expression (`count("distinct user_id")`), as in Rails.
+    def count(column = nil)
       return 0 if @null
-      rows = ActiveRecord.adapter.select_rows(bound_count_sql)
+      # Rails answers a Hash here; the shape-directed rename to
+      # `group_count` does not see a grouped relation held in a variable.
+      raise ArgumentError, "count(column) on a grouped relation answers a Hash; call group_count(column)" unless column.nil? || @groups.empty?
+      rows = ActiveRecord.adapter.select_rows(bound_count_sql(column))
       rows.length == 0 ? 0 : rows[0]["n"].to_i
     end
 
@@ -2246,7 +2251,7 @@ module ActiveRecord
     # composite key here first. HAVING and DISTINCT ride the same SQL
     # as `to_sql` so the Hash only contains surviving groups, and a
     # distinct projection counts distinct values per group (#343).
-    def group_count
+    def group_count(column = nil)
       return {} if @null
       key = @groups.join(", ")
       # DISTINCT uses a subquery so a multi-column / aliased `select`
@@ -2255,7 +2260,12 @@ module ActiveRecord
       # (source columns and aggregates), then distinct-count rows that
       # belong to survivors. Non-distinct keeps `@select_sql` so HAVING
       # can name selected aliases, matching `count_sql`.
-      sql = if @distinct
+      term = count_column_term(column)
+      sql = if !term.nil?
+        append_group_having(
+          append_join_where("#{cte_prefix}SELECT #{key} AS k, COUNT(#{term}) AS n FROM #{from_source}")
+        )
+      elsif @distinct
         inner = append_join_where(
           "#{cte_prefix}SELECT DISTINCT #{distinct_count_columns}, #{key} AS k FROM #{from_source}"
         )
@@ -3035,7 +3045,7 @@ module ActiveRecord
       Relation.inline_sql(bound_count_sql)
     end
 
-    def bound_count_sql
+    def bound_count_sql(column = nil)
       # DISTINCT / GROUP BY must count the result-set shape, not the
       # underlying rows (#343). Scalar `count` on a grouped relation
       # counts groups; the Hash form is `group_count`. LIMIT/OFFSET
@@ -3050,6 +3060,10 @@ module ActiveRecord
           append_join_where("#{cte_prefix}SELECT #{dist}#{cols} FROM #{from_source}")
         )
         return "SELECT COUNT(*) AS n FROM (#{inner}) AS __rh_count"
+      end
+      term = count_column_term(column)
+      unless term.nil?
+        return append_join_where("#{cte_prefix}SELECT COUNT(#{term}) AS n FROM #{from_source}")
       end
       if @distinct
         inner = append_join_where(
@@ -3118,6 +3132,15 @@ module ActiveRecord
     def from_source
       src = @from
       src.nil? ? @table : src
+    end
+
+    # The COUNT argument of `count(column)`: nil for every row (no column,
+    # or `:all`), else the column or SQL String, DISTINCT on a distinct
+    # relation.
+    def count_column_term(column)
+      return nil if column.nil? || column == :all
+      term = column.is_a?(Symbol) ? aggregate_column(column.to_s) : column.to_s
+      @distinct ? "DISTINCT #{term}" : term
     end
 
     # A calculation's column, as Rails' `aggregate_column` writes it: on

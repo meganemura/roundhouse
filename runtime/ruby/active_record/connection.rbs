@@ -232,7 +232,7 @@ module ActiveRecord
     def self.unscoped: () ?{ () -> untyped } -> untyped
     def self._default_scope_where: () -> Hash[Symbol, untyped]
     def self._find_in_scope: (Integer | Float | String | nil id) -> Base?
-    def self.count: () -> Integer
+    def self.count: (?(Symbol | String | nil) column) -> Integer
     def self.last: () -> Base?
     def self.destroy_all: () -> Array[Base]
     def self.none: () -> Relation

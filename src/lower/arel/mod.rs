@@ -153,6 +153,26 @@ fn is_id_finder(method: &str, args: &[Expr]) -> bool {
     method == "find" && !args.is_empty()
 }
 
+/// `count(column)` is the SQL `COUNT(column)` only a relation answers.
+/// On hydrated rows it is `Array#count(obj)`, which counts the elements
+/// equal to the column name and so answers 0. The builder folds only the
+/// bare `count`.
+pub(crate) fn is_column_count(method: &str, args: &[Expr]) -> bool {
+    method == "count" && !args.is_empty()
+}
+
+/// A receiver that is still a relation: a builder link, `all`, or an app
+/// scope. `pluck(:x).count(1)`, `map(&:x).count(y)` and `to_a.count(y)`
+/// count the elements of an Array, in Rails too, so their receivers may
+/// still lift.
+fn is_relation_head(recv: &Expr, scopes: &crate::det::HashSet<crate::ident::Symbol>) -> bool {
+    matches!(
+        recv.node.as_ref(),
+        ExprNode::Send { method, block: None, .. }
+            if method.as_str() == "all" || is_relation_refiner(method.as_str()) || scopes.contains(method)
+    )
+}
+
 /// `find_by_<attr>` / `find_by_<attr>!` — Rails synthesizes one of these
 /// per column. `find_by_` alone (no attribute) isn't a real finder.
 fn is_dynamic_finder(method: &str) -> bool {
@@ -727,9 +747,10 @@ fn rewrite_arel_inner(
     // materialized rows, not a chain link — the claim stays.
     let unlifted_relation_consumer = matches!(
         expr.node.as_ref(),
-        ExprNode::Send { recv: Some(_), block: None, method, args, .. }
+        ExprNode::Send { recv: Some(recv), block: None, method, args, .. }
             if requires_relation_receiver_or_scope(method, scopes)
                 || is_id_finder(method.as_str(), args)
+                || is_column_count(method.as_str(), args) && is_relation_head(recv, scopes)
     );
     if unlifted_relation_consumer {
         let mut changed = normalized;

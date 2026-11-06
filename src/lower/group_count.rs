@@ -6,12 +6,15 @@
 //! runtime avoids); the runtime's `group_count` builds the
 //! SELECT … GROUP BY and hydrates the Hash.
 //!
-//! Shape-directed: a zero-arg block-less `count` whose receiver chain
-//! contains `group(...)` (directly, or through query refiners such as
-//! `having` / `distinct` / `select`). Rails still answers a Hash for
-//! those; only the immediate `group.count` pair is simple enough for
-//! the Arel fold. Runs on the post-analyze hook with its siblings so
-//! every target consumes the grounded form.
+//! `group(:col).count(:other)` keeps its column: COUNT(other) per group.
+//!
+//! Shape-directed: a block-less `count` with at most one argument
+//! whose receiver chain contains `group(...)` (directly, or through
+//! query refiners such as `having` / `distinct` / `select`). Rails
+//! still answers a Hash for those; only the immediate bare
+//! `group.count` pair is simple enough for the Arel fold. Runs on the
+//! post-analyze hook with its siblings so every target consumes the
+//! grounded form.
 
 use crate::app::App;
 use crate::expr::{Expr, ExprNode};
@@ -52,7 +55,7 @@ pub fn grouped_count_parts(expr: &Expr) -> Option<GroupedCount<'_>> {
     let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*expr.node else {
         return None;
     };
-    if !matches!(method.as_str(), "count" | "group_count") || !args.is_empty() {
+    if !matches!(method.as_str(), "count" | "group_count") || args.len() > 1 {
         return None;
     }
     group_in_relation_chain(recv)
