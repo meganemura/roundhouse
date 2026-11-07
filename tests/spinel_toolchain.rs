@@ -134,6 +134,10 @@ mod data_paths_contract;
 mod eager_load_filter_contract;
 #[path = "spinel_toolchain/erb_template.rs"]
 mod erb_template;
+#[path = "support/form_with_scope.rs"]
+mod form_with_scope_contract;
+#[path = "spinel_toolchain/form_with_scope.rs"]
+mod form_with_scope;
 #[path = "support/anonymous_keywords.rs"]
 mod anonymous_keywords;
 #[path = "support/lambda_signatures.rs"]

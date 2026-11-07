@@ -177,7 +177,8 @@ fn wrap_field_errors(
     binding: &FormBuilderBinding,
     ctx: &ViewCtx,
 ) -> Vec<Expr> {
-    if !kind.wraps_field_errors() || !binding.metadata_class(ctx).is_some_and(|class| ctx.i18n.has_errors_for(class)) || ctx.i18n.field_error_proc().is_some() {
+    // A recordless form has no object for Rails to ask about errors
+    if binding.recordless || !kind.wraps_field_errors() || !binding.metadata_class(ctx).is_some_and(|class| ctx.i18n.has_errors_for(class)) || ctx.i18n.field_error_proc().is_some() {
         return out;
     }
     let Some(field_sym) = field_symbol(field) else { return out };
@@ -252,7 +253,8 @@ fn emit_check_box(
     let is_bool_reader = ctx
         .bool_readers
         .get(binding.metadata_class(ctx).unwrap_or(""))
-        .is_some_and(|s| s.contains(field_str));
+        .is_some_and(|s| s.contains(field_str))
+        && !binding.recordless;
     let checked_expr = if is_bool_reader {
         let record_ref = Expr::new(
             Span::synthetic(),

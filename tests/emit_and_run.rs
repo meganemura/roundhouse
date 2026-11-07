@@ -36,6 +36,10 @@ mod session_cookie_key;
 mod inertia_runtime_props;
 #[path = "emit_and_run/form_builder_fields.rs"]
 mod form_builder_fields;
+#[path = "support/form_with_scope.rs"]
+mod form_with_scope_contract;
+#[path = "emit_and_run/form_with_scope.rs"]
+mod form_with_scope;
 #[path = "emit_and_run/time_zone_tzinfo.rs"]
 mod time_zone_tzinfo;
 
