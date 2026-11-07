@@ -1632,6 +1632,15 @@ fn binop_of(e: &Expr) -> Option<&str> {
         // re-parses as `hrc = (HatRequest.count > 0)`, the local becoming
         // the comparison.
         ExprNode::Assign { .. } | ExprNode::OpAssign { .. } | ExprNode::MultiAssign { .. } => Some("="),
+        // A method assignment binds the same way: `(self.code = v) == v`
+        // rendered bare is `self.code = (v == v)`, the column becoming
+        // the comparison.
+        ExprNode::Send { recv: Some(_), method, args, .. }
+            if (is_setter_method(method.as_str()) && args.len() == 1)
+                || (method.as_str() == "[]=" && args.len() == 2) =>
+        {
+            Some("=")
+        }
         // A range binds looser than every infix operator and `||`/`&&`:
         // `out << (start...limit)` written bare is `(out << start)...limit`,
         // which pushes the Integer (and `ruby -w` flags the range as

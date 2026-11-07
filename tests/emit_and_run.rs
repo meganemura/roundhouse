@@ -159,6 +159,10 @@ mod stdlib_rexml_include;
 mod mutable_literals_contract;
 #[path = "emit_and_run/mutable_literals.rs"]
 mod mutable_literals;
+#[path = "support/method_assignment_operand.rs"]
+mod method_assignment_operand_contract;
+#[path = "emit_and_run/method_assignment_operand.rs"]
+mod method_assignment_operand;
 #[path = "support/auto_source_gem.rs"]
 mod auto_source_gem_contract;
 #[path = "emit_and_run/auto_source_gem.rs"]

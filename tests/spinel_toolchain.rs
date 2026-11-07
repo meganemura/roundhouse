@@ -274,6 +274,10 @@ mod stdlib_rexml_include;
 mod mutable_literals_contract;
 #[path = "spinel_toolchain/mutable_literals.rs"]
 mod mutable_literals;
+#[path = "support/method_assignment_operand.rs"]
+mod method_assignment_operand_contract;
+#[path = "spinel_toolchain/method_assignment_operand.rs"]
+mod method_assignment_operand;
 #[path = "support/auto_source_gem.rs"]
 mod auto_source_gem_contract;
 #[path = "spinel_toolchain/auto_source_gem.rs"]
